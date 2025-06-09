@@ -2,36 +2,70 @@
 /**
  * scrapeMeta.mjs
  * --------------
- * Scrape a URL for { previewImage, title }.
+ * Scrape one or many URLs for { title, previewImage }.
  *
- * 1. Try cheap fetch + Cheerio.
- * 2. If both values are still null → spin up headless Chrome (Puppeteer).
+ * 1. Cheap fetch + Cheerio         (fast path)
+ * 2. Headless Chrome (Puppeteer)   (fallback)
  *
- * Usage:
+ * Usage
+ * -----
+ *   # single URL
  *   node scrapeMeta.mjs https://example.com
  *
- * Prints prettified JSON to stdout (or exits non-zero on failure).
+ *   # many URLs (one per line in urls.txt)
+ *   node scrapeMeta.mjs --file urls.txt
+ *   node scrapeMeta.mjs -f urls.txt
  */
 
 import { argv, exit } from 'node:process';
+import { promises as fs } from 'node:fs';
 import { load } from 'cheerio';
 import { URL } from 'node:url';
 import puppeteer from 'puppeteer';
 
-if (argv.length < 3) {
-  console.error('Usage: node scrapeMeta.mjs <url>');
+/* ╔══════════════════════════════════════════════════════════════════╗ */
+/* ║             1.  Parse CLI arguments (url or --file)             ║ */
+/* ╚══════════════════════════════════════════════════════════════════╝ */
+const args = argv.slice(2);
+let filePath = null;
+const urls = [];
+
+// crude arg parser: -f foo.txt  |  --file foo.txt  |  bare URLs
+for (let i = 0; i < args.length; i++) {
+  const a = args[i];
+  if (a === '-f' || a === '--file') {
+    filePath = args[++i];           // next arg is filename
+  } else {
+    urls.push(a);
+  }
+}
+
+if (filePath) {
+  try {
+    const txt = await fs.readFile(filePath, 'utf8');
+    txt.split(/\r?\n/).forEach((line) => {
+      const u = line.trim();
+      if (u) urls.push(u);
+    });
+  } catch (err) {
+    console.error(`❌  Cannot read file "${filePath}":`, err.message);
+    exit(1);
+  }
+}
+
+if (!urls.length) {
+  console.error('Usage:\n  node scrapeMeta.mjs <url>\n  node scrapeMeta.mjs --file urls.txt');
   exit(1);
 }
 
-const targetUrl = argv[2];
-
-/* ---------- constants ---------- */
+/* ╔══════════════════════════════════════════════════════════════════╗ */
+/* ║                       2.  Shared helpers                         ║ */
+/* ╚══════════════════════════════════════════════════════════════════╝ */
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
   'AppleWebKit/537.36 (KHTML, like Gecko) ' +
   'Chrome/125.0.0.0 Safari/537.36';
 
-/* ---------- helpers ---------- */
 const normalizeTitle = (raw = '') =>
   raw.includes('|') ? raw.split('|')[0].trim() : raw.trim() || null;
 
@@ -47,17 +81,15 @@ const absolutize = (src, base) => {
 const extractCheerio = (html, baseUrl) => {
   const $ = load(html);
 
-  /* grab title */
   const title = normalizeTitle($('title').first().text());
 
-  /* grab image */
   const selectors = [
     'meta[property="og:image"]',
     'meta[name="og:image"]',
     'meta[name="twitter:image"]',
     'meta[itemprop="image"]',
     'link[rel="image_src"]',
-    'img[src]', // fallback – first image in markup
+    'img[src]',
   ];
 
   let img = null;
@@ -69,80 +101,95 @@ const extractCheerio = (html, baseUrl) => {
     }
   }
 
-  return { previewImage: img, title };
+  return { title, previewImage: img };
 };
 
-/* ---------- main flow ---------- */
+/* ╔══════════════════════════════════════════════════════════════════╗ */
+/* ║                3.  Scrape function (fast + fallback)            ║ */
+/* ╚══════════════════════════════════════════════════════════════════╝ */
+let browser = null;           // lazily launched only if needed
+
+async function scrapeOne(targetUrl) {
+  /* fast path */
+  const res = await fetch(targetUrl, {
+    redirect: 'follow',
+    headers: { 'user-agent': UA, 'accept-language': 'en-US,en;q=0.9' },
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const html = await res.text();
+
+  let { title, previewImage } = extractCheerio(html, targetUrl);
+
+  /* fallback with Puppeteer */
+  if (!title && !previewImage) {
+    if (!browser) browser = await puppeteer.launch({ headless: 'new' });
+    const page = await browser.newPage();
+    await page.setUserAgent(UA);
+    await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+
+    ({ title, previewImage } = await page.evaluate(() => {
+      const abs = (u) => { try { return new URL(u, location.href).href; } catch { return u; } };
+      const attr = (sel, a) => document.querySelector(sel)?.getAttribute(a);
+
+      let candidate =
+        attr('meta[property="og:image:secure_url"]', 'content') ||
+        attr('meta[property="og:image"]', 'content') ||
+        attr('meta[name="og:image"]', 'content') ||
+        attr('meta[name="twitter:image"]', 'content') ||
+        attr('meta[itemprop="image"]', 'content') ||
+        attr('link[rel="image_src"]', 'href') ||
+        null;
+
+      const looksBad = (src) =>
+        !src || src.endsWith('.svg') || /sprite|icon/i.test(src);
+
+      if (!candidate || looksBad(candidate)) {
+        const imgs = Array.from(document.images)
+          .map((img) => ({
+            src: img.currentSrc || img.src,
+            area: img.naturalWidth * img.naturalHeight,
+            w: img.naturalWidth,
+            h: img.naturalHeight,
+          }))
+          .filter((o) => o.w >= 200 && o.h >= 200 && !o.src.endsWith('.svg'))
+          .sort((a, b) => b.area - a.area);
+        if (imgs.length) candidate = imgs[0].src;
+      }
+
+      if (candidate) candidate = abs(candidate);
+
+      let ttl = document.title || null;
+      if (ttl?.includes('|')) ttl = ttl.split('|')[0].trim();
+
+      return { title: ttl, previewImage: candidate || null };
+    }));
+
+    await page.close();
+  }
+
+  return { url: targetUrl, title, previewImage };
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗ */
+/* ║                     4.  Iterate & output                        ║ */
+/* ╚══════════════════════════════════════════════════════════════════╝ */
 (async () => {
   try {
-    /* 1️⃣  fast path ------------------------------------------------------- */
-    const res = await fetch(targetUrl, {
-      redirect: 'follow',
-      headers: { 'user-agent': UA, 'accept-language': 'en-US,en;q=0.9' },
-    });
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-    const html = await res.text();
-
-    let { previewImage, title } = extractCheerio(html, targetUrl);
-
-    /* 2️⃣  escalate if nothing found -------------------------------------- */
-    if (!previewImage && !title) {
-      const browser = await puppeteer.launch({ headless: 'new' });
-      const page = await browser.newPage();
-      await page.setUserAgent(UA);
-      await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 30000 });
-
-      /* evaluate in page context */
-      ({ previewImage, title } = await page.evaluate(() => {
-        /* helpers inside browser */
-        const abs = (u) => { try { return new URL(u, location.href).href; } catch { return u; } };
-        const attr = (sel, a) => document.querySelector(sel)?.getAttribute(a);
-
-        /* 1. meta-declared candidate ------------------------------------- */
-        let candidate =
-          attr('meta[property="og:image:secure_url"]', 'content') ||
-          attr('meta[property="og:image"]', 'content') ||
-          attr('meta[name="og:image"]', 'content') ||
-          attr('meta[name="twitter:image"]', 'content') ||
-          attr('meta[itemprop="image"]', 'content') ||
-          attr('link[rel="image_src"]', 'href') ||
-          null;
-
-        const looksBad = (src) =>
-          !src ||
-          src.endsWith('.svg') ||                      // usually an icon
-          /sprite|icon/i.test(src);                    // smells like UI chrome
-
-        /* 2. if missing or looks bad → choose largest real bitmap ------- */
-        if (!candidate || looksBad(candidate)) {
-          const imgs = Array.from(document.images)
-            .map((img) => ({
-              src: img.currentSrc || img.src,
-              area: img.naturalWidth * img.naturalHeight,
-              w: img.naturalWidth,
-              h: img.naturalHeight,
-            }))
-            .filter((o) => o.w >= 200 && o.h >= 200 && !o.src.endsWith('.svg'))
-            .sort((a, b) => b.area - a.area);          // biggest first
-
-          if (imgs.length) candidate = imgs[0].src;
-        }
-
-        if (candidate) candidate = abs(candidate);
-
-        /* title (trim “| …”) */
-        let ttl = document.title || null;
-        if (ttl?.includes('|')) ttl = ttl.split('|')[0].trim();
-
-        return { previewImage: candidate || null, title: ttl };
-      }));
-
-      await browser.close();
+    const results = [];
+    for (const url of urls) {
+      try {
+        results.push(await scrapeOne(url));
+      } catch (err) {
+        results.push({ url, error: err.message });
+      }
     }
+    if (browser) await browser.close();
 
-    console.log(JSON.stringify({ previewImage, title }, null, 2));
+    /* pretty-print */
+    console.log(JSON.stringify(results.length === 1 ? results[0] : results, null, 2));
   } catch (err) {
-    console.error(`❌ Failed to scrape ${targetUrl}:`, err.message);
+    console.error('❌  Unexpected failure:', err.message);
+    if (browser) await browser.close();
     exit(1);
   }
 })();
