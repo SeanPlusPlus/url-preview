@@ -18,15 +18,12 @@ $ node scrapeMeta.mjs https://example.com
 
 ## Features
 
-| Feature                   | Notes                                                                                                              |                 |                       |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------ | --------------- | --------------------- |
-| **Title extraction**      | Trims everything after the first \`                                                                                | ` (e.g. `“News  | My Site” → “News”\`). |
-| **Preview‑image ranking** | Prefers OG / Twitter / JSON‑LD images; falls back to the largest bitmap ≥ 200 × 200 px; skips SVG sprites & icons. |                 |                       |
-| **Bulk mode**             | `--file urls.txt` scrapes any number of URLs (one per line) and prints a JSON array.                               |                 |                       |
-| **One Chromium per run**  | Puppeteer launches once and is reused for all fallback scrapes.                                                    |                 |                       |
-| **No secrets required**   | All public scraping—no API keys.                                                                                   |                 |                       |
+- Title extraction – Strips everything after the first vertical bar, so "News | My Site" becomes "News".
+- Smart image pick – Prefers OG/Twitter/JSON‑LD images; otherwise grabs the largest non‑SVG bitmap that’s at least 200 × 200 px.
+- Bulk mode – Add -f urls.txt to scrape a list of URLs (one per line) and get back a single JSON array.
+- Single Chrome session – Reuses one headless browser instance for all fallback scrapes, keeping runs fast.
+- No secrets needed – Pure public scraping—no API keys, tokens, or accounts required.
 
----
 
 ## Prerequisites
 
