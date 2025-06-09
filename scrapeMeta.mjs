@@ -1,92 +1,117 @@
 #!/usr/bin/env node
 /**
- * Scrape <title> and open-graph image for any URL.
- *
- * Usage:
- *   node scrapeMeta.mjs https://example.com
- *
- * Output (pretty-printed JSON):
- *   {
- *     "ogimage": "https://…/some-image.jpg",
- *     "title":   "Example Domain"
- *   }
+ * scrapeMeta.mjs
+ * --------------
+ * Returns { ogimage, title } for any URL.
+ * 1. Try fast fetch + Cheerio
+ * 2. If still null → Puppeteer (headless Chrome)
  */
 
 import { argv, exit } from 'node:process';
 import { load } from 'cheerio';
 import { URL } from 'node:url';
+import puppeteer from 'puppeteer';
 
 if (argv.length < 3) {
-  console.error('❌  Please pass a URL:  node scrapeMeta.mjs https://example.com');
+  console.error('Usage: node scrapeMeta.mjs <url>');
   exit(1);
 }
 
 const targetUrl = argv[2];
 
-/**
- * Make a fetch request that looks like a real browser.
- * Some sites strip meta tags for “generic” user-agents.
- */
-async function fetchHtml(url) {
-  const res = await fetch(url, {
-    redirect: 'follow',
-    headers: {
-      // Chrome 125 UA string, adjust when needed
-      'user-agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-        'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-        'Chrome/125.0.0.0 Safari/537.36',
-      'accept-language': 'en-US,en;q=0.9',
-    },
-  });
+/* ---------- helpers ---------- */
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+  'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+  'Chrome/125.0.0.0 Safari/537.36';
 
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return res.text();
+function normalizeTitle(raw) {
+  if (!raw) return null;
+  const clean = raw.trim();
+  return clean.includes('|') ? clean.split('|')[0].trim() : clean;
 }
 
-/**
- * Pick the best image candidate from the parsed DOM.
- */
-function extractImage($) {
+function absolutize(src, base) {
+  if (!src || /^https?:\/\//i.test(src)) return src;
+  try {
+    return new URL(src, base).href;
+  } catch {
+    return src;
+  }
+}
+
+function extractWithCheerio(html, baseUrl) {
+  const $ = load(html);
+
+  /* title */
+  const title = normalizeTitle($('title').first().text());
+
+  /* og / twitter / first img */
   const selectors = [
     'meta[property="og:image"]',
     'meta[name="og:image"]',
     'meta[name="twitter:image"]',
     'meta[itemprop="image"]',
     'link[rel="image_src"]',
+    'img[src]', // last-ditch fallback
   ];
 
+  let ogimage = null;
   for (const sel of selectors) {
-    const content =
-      $(sel).attr('content') ??
-      $(sel).attr('href'); // for <link rel="image_src" href="...">
-    if (content) return content;
+    const val = $(sel).attr('content') ?? $(sel).attr('href') ?? $(sel).attr('src');
+    if (val) {
+      ogimage = absolutize(val, baseUrl);
+      break;
+    }
   }
 
-  // --- OPTIONAL fallback: first <img> on the page ---
-  const firstImg = $('img[src]').first().attr('src');
-  return firstImg ?? null;
+  return { ogimage, title };
 }
 
+/* ---------- main flow ---------- */
 (async () => {
   try {
-    const html = await fetchHtml(targetUrl);
-    const $ = load(html);
+    /* 1. Fast path */
+    const res = await fetch(targetUrl, {
+      redirect: 'follow',
+      headers: { 'user-agent': UA, 'accept-language': 'en-US,en;q=0.9' },
+    });
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    const html = await res.text();
+    let { ogimage, title } = extractWithCheerio(html, targetUrl);
 
-    // ---- title ----
-    let title = $('title').first().text().trim() || null;
-    if (title && title.includes('|')) title = title.split('|')[0].trim();
+    /* If both are null, escalate to Puppeteer */
+    if (!ogimage && !title) {
+      const browser = await puppeteer.launch({ headless: 'new' });
+      const page = await browser.newPage();
+      await page.setUserAgent(UA);
+      await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 30000 });
 
-    // ---- og image ----
-    let ogimage = extractImage($);
+      /* evaluate in page context */
+      ({ ogimage, title } = await page.evaluate(() => {
+        const pick = (sel, attr) => document.querySelector(sel)?.getAttribute(attr);
+        const abs = (src) => {
+          try { return new URL(src, location.href).href; } catch { return src; }
+        };
 
-    // Resolve relative URLs to absolute
-    if (ogimage && !/^https?:\/\//i.test(ogimage)) {
-      try {
-        ogimage = new URL(ogimage, targetUrl).href;
-      } catch {
-        // ignore bad URL resolution — leave as-is
-      }
+        let img =
+          pick('meta[property="og:image"]', 'content') ||
+          pick('meta[name="og:image"]', 'content') ||
+          pick('meta[name="twitter:image"]', 'content') ||
+          pick('meta[itemprop="image"]', 'content') ||
+          pick('link[rel="image_src"]', 'href') ||
+          pick('img[src]', 'src') ||
+          null;
+
+        if (img) img = abs(img);
+
+        let ttl = document.title || null;
+        if (ttl && ttl.includes('|')) ttl = ttl.split('|')[0].trim();
+
+        return { ogimage: img, title: ttl };
+      }));
+
+      await browser.close();
     }
 
     console.log(JSON.stringify({ ogimage, title }, null, 2));
