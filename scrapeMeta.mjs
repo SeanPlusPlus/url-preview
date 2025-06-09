@@ -28,9 +28,12 @@ try {
 
   // --- Extract OG image ---
   const ogimage =
-    $('meta[property="og:image"]').attr('content') ??
-    $('meta[name="twitter:image"]').attr('content') ??
-    null;
+     $('meta[property="og:image"]').attr('content') ??
+     $('meta[name="og:image"]').attr('content') ??
+     $('meta[name="twitter:image"]').attr('content') ??
+     $('meta[itemprop="image"]').attr('content') ??
+     $('link[rel="image_src"]').attr('href') ??
+     null;
 
   // --- Extract <title> ---
   let title = $('title').first().text().trim() || null;
